@@ -35,6 +35,10 @@
 *.dot
 *.png
 
-# Libraries and Testfiles
+# Libraries, Settings and Testfiles
 selection2024/*
 hoa-tools/*
+*.l
+*.y
+ParityGameSolver/builds
+ParityGameSolver/.vscode/
