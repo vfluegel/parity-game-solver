@@ -30,3 +30,11 @@
 *.exe
 *.out
 *.app
+
+# Images
+*.dot
+*.png
+
+# Libraries and Testfiles
+selection2024/*
+hoa-tools/*
