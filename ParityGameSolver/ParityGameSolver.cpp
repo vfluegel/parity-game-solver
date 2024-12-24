@@ -21,6 +21,7 @@ struct PGTransition
 {
     oxidd::bdd_function label;
     std::unordered_set<int> notControllable;
+    int target{ -1 };
 };
 
 struct PGState 
@@ -252,49 +253,68 @@ int main(int argc, char** argv)
         }
         priorities[state.accSig[0]].push_back(s);
         
+        std::unordered_set<int> allUncontrollableAP;
+        std::vector<PGTransition> allOutgoing;
+        // Collect all outgoing transitions and not controllable APs
         for (size_t t = 0; t < state.noTrans; t++)
         {
             assert(state.transitions[t].noSucc == 1);
-            auto transitions = btreeToBDD(state.transitions[t].label, controllableAPs);
-            if (transitions.notControllable.empty()) 
-            {
-                // The transition is entirely made up of controllable APs, we can just use it as is
-                PGstates[s].belongsToEven = true;
-                outgoingTransitions[state.id][state.transitions[t].successors[0]] = transitions.label;
-                incomingTransitions[state.transitions[t].successors[0]][state.id] = transitions.label;
+            auto transition = btreeToBDD(state.transitions[t].label, controllableAPs);
+            transition.target = state.transitions[t].successors[0];
+            allOutgoing.push_back(transition);
+
+            allUncontrollableAP.insert(transition.notControllable.begin(), transition.notControllable.end());
+        }
+
+        if (allUncontrollableAP.empty()) 
+        {
+            // The transitions are all entirely made up of controllable APs, we can just use it as is
+            PGstates[s].belongsToEven = true;
+            for (PGTransition t : allOutgoing) {
+                assert (t.target != -1);
+                outgoingTransitions[state.id][t.target] = t.label;
+                incomingTransitions[t.target][state.id] = t.label;
             }
-            else 
-            {
-                int numNotControllable = transitions.notControllable.size();
-                // Possible combinations for the uncontrollable vars
-                int numCombinations = 1 << numNotControllable; 
-                
-                for (int comb = 0; comb < numCombinations; comb++) {
-                    // Start by fixing the first variable in the uncontrollable set
-                    bool val = (comb & (1 << 0)) != 0;
-                    auto uncontrollableAPIterator = transitions.notControllable.begin();
-                    oxidd::bdd_function fixedTransition = val ? aps[*uncontrollableAPIterator] : ~aps[*uncontrollableAPIterator];
+        }
+        else 
+        {
+            int numNotControllable = allUncontrollableAP.size();
+            // Possible combinations for the uncontrollable vars
+            int numCombinations = 1 << numNotControllable; 
+            
+            for (int comb = 0; comb < numCombinations; comb++) {
+                // Start by fixing the first variable in the uncontrollable set
+                bool val = (comb & (1 << 0)) != 0;
+                auto uncontrollableAPIterator = allUncontrollableAP.begin();
+                oxidd::bdd_function fixedTransition = val ? aps[*uncontrollableAPIterator] : ~aps[*uncontrollableAPIterator];
+                uncontrollableAPIterator++;
+
+                // Now go over the rest of the uncontrollable vars and fix those the same way
+                for (int v = 1; v < numNotControllable; v++) {
+                    assert(uncontrollableAPIterator != allUncontrollableAP.end());
+                    val = (comb & (1 << v)) != 0;
+                    fixedTransition &= val ? aps[*uncontrollableAPIterator] : ~aps[*uncontrollableAPIterator];
                     uncontrollableAPIterator++;
+                }
 
-                    // Now go over the rest of the uncontrollable vars and fix those the same way
-                    for (int v = 1; v < numNotControllable; v++) {
-                        assert(uncontrollableAPIterator != transitions.notControllable.end());
-                        val = (comb & (1 << v)) != 0;
-                        fixedTransition &= val ? aps[*uncontrollableAPIterator] : ~aps[*uncontrollableAPIterator];
-                        uncontrollableAPIterator++;
-                    }
-
-                    size_t intermediaryState = PGstates.size();
-                    PGstates.push_back({state.id, fixedTransition, true});
-                    // New intermediary state inherits priority from original
-                    priorities[state.accSig[0]].push_back(intermediaryState);
-                    outgoingTransitions[state.id][intermediaryState] = fixedTransition;
-                    incomingTransitions[intermediaryState][state.id] = fixedTransition;
-                    outgoingTransitions[intermediaryState][state.transitions[t].successors[0]] = fixedTransition & transitions.label;
-                    incomingTransitions[state.transitions[t].successors[0]][intermediaryState] = fixedTransition & transitions.label;
+                size_t intermediaryState = PGstates.size();
+                PGstates.push_back({state.id, fixedTransition, true});
+                // New intermediary state inherits priority from original
+                priorities[state.accSig[0]].push_back(intermediaryState);
+                outgoingTransitions[state.id][intermediaryState] = fixedTransition;
+                incomingTransitions[intermediaryState][state.id] = fixedTransition;
+                
+                for (PGTransition t : allOutgoing) {
+                    oxidd::bdd_function newLabel = fixedTransition & t.label;
+                    if (newLabel.satisfiable()) {
+                        assert (t.target != -1);
+                        outgoingTransitions[intermediaryState][t.target] = newLabel;
+                        incomingTransitions[t.target][intermediaryState] = newLabel;
+                    }   
                 }
             }
         }
+        
     }
 
     std::cout << "Starting Zielonka...\n";
