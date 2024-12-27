@@ -22,6 +22,7 @@ struct PGTransition
     oxidd::bdd_function label;
     std::unordered_set<int> notControllable;
     int target{ -1 };
+    int transitionPrio{ -1 };
 };
 
 struct PGState 
@@ -65,20 +66,20 @@ PGTransition btreeToBDD(BTree* tree, std::vector<bool> controllable) {
         left = btreeToBDD(tree->left, controllable);
         right = btreeToBDD(tree->right, controllable);
         transition.label = left.label & right.label;
-        transition.notControllable.insert(left.notControllable.begin(), left.notControllable.end());
-        transition.notControllable.insert(right.notControllable.begin(), right.notControllable.end());
+        transition.notControllable.merge(left.notControllable);
+        transition.notControllable.merge(right.notControllable);
         break;
     case NT_OR:
         left = btreeToBDD(tree->left, controllable);
         right = btreeToBDD(tree->right, controllable);      
         transition.label = left.label | right.label;
-        transition.notControllable.insert(left.notControllable.begin(), left.notControllable.end());
-        transition.notControllable.insert(right.notControllable.begin(), right.notControllable.end());
+        transition.notControllable.merge(left.notControllable);
+        transition.notControllable.merge(right.notControllable);
         break;
     case NT_NOT:
         left = btreeToBDD(tree->left, controllable);
         transition.label = ~left.label;
-        transition.notControllable.insert(left.notControllable.begin(), left.notControllable.end());
+        transition.notControllable.merge(left.notControllable);
         break;
     case NT_BOOL:
         transition.label = tree->id ? manager.t() : manager.f();
@@ -89,6 +90,24 @@ PGTransition btreeToBDD(BTree* tree, std::vector<bool> controllable) {
     }
 
     return transition;
+}
+
+void handlePriorityTree(BTree* tree, std::vector<int>& prios)
+{
+    if (tree->type == NT_INF) {
+        int priority = 2 * (tree->left->id + 1);
+        if (prios[tree->left->id] < priority) {
+            prios[tree->left->id] = priority;
+        }
+    } else if (tree->type == NT_FIN) {
+        int priority = 2 * (tree->left->id + 1) + 1;
+        if (prios[tree->left->id] < priority) {
+            prios[tree->left->id] = priority;
+        }
+    } else {
+        if (tree->left != nullptr) handlePriorityTree(tree->left, prios);
+        if (tree->right != nullptr) handlePriorityTree(tree->right, prios);
+    }
 }
 
 std::unordered_set<int> getAttractors(const std::vector<int>& targetSet, bool evenPlayer, const std::vector<bool>& includedStates) {
@@ -141,11 +160,11 @@ std::unordered_set<int> getAttractors(const std::vector<int>& targetSet, bool ev
 }
 
 std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates) {
-    std::cout << "New Zielonka iteration...\n";
+    //std::cout << "New Zielonka iteration...\n";
     std::array<std::unordered_set<int>, 2> res{};
     if (std::all_of(includedStates.begin(), includedStates.end(), [](bool v) { return !v; })) {
         // No state is included, we can return the default constructed empty lists
-        std::cout << "No more states included, we return empty\n";
+        //std::cout << "No more states included, we return empty\n";
         return res;
     }
     
@@ -174,7 +193,7 @@ std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates
     auto zielonkaRes = zielonka(newIncludedStates);
     if (zielonkaRes[1-i].empty()) 
     {
-        R.insert(zielonkaRes[i].begin(), zielonkaRes[i].end());
+        R.merge(zielonkaRes[i]);
         // Only set the first part of the pair
         res[i] = R;
         assert (res[1-i].empty());
@@ -188,7 +207,7 @@ std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates
             newIncludedStates[a] = false;
         }
         auto zielonkaResI = zielonka(newIncludedStates);
-        S.insert(zielonkaResI[1-i].begin(), zielonkaResI[1-i].end());
+        S.merge(zielonkaResI[1-i]);
         res[i] = zielonkaResI[i];
         res[1 - i] = S;
     }
@@ -197,75 +216,77 @@ std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates
 
 int main(int argc, char** argv)
 {
-    oxidd::bdd_function var1 = manager.new_var();
-    oxidd::bdd_function var2 = manager.new_var();
-
-    oxidd::bdd_function boolF = var1 & ~var2;
-    oxidd::util::slice<std::pair<oxidd::bdd_function, bool>> args{ {var1, true}, {var2, false} };
-    std::cout << "Original: " << boolF.eval(args) << std::endl;
-    std::vector<std::pair<oxidd::bdd_function, oxidd::bdd_function>> sub_vars { {var2, manager.t()} };
-    oxidd::bdd_substitution sub { sub_vars.begin(), sub_vars.end() };
-    auto newF = boolF.substitute(sub);
-    oxidd::util::slice<std::pair<oxidd::bdd_function, bool>> args2{ {var1, true}, {var2, false} };
-    std::cout << "Replaced: " << newF.eval(args2) << std::endl;
-
     HoaData hoa;
     defaultsHoa(&hoa);
     auto inputFile = fopen(argv[1], "r");
     int res = parseHoa(inputFile, &hoa);
     fclose(inputFile);
-    if (res == 0) {
-        std::cout << "Finished parsing the file\n";
-    }
-    else {
+    if (res != 0) {
         std::cout << "Input could not be parsed!\n";
     }
 
-    generateDotFile(&hoa, "inputHOA.dot");
+    //generateDotFile(&hoa, "inputHOA.dot");
 
-    std::cout << "Creating AP variables...\n";
     for (size_t ap = 0; ap < hoa.noAPs; ap++)
     {
         aps[ap] = manager.new_var();
     }
 
-    std::cout << "Creating aliases...\n";
     for (size_t a = 0; a < hoa.noAliases; a++)
     {
         aliases[hoa.aliases[a].alias] = hoa.aliases[a].labelExpr;
     }
 
-    std::cout << "Creating controllable APs...\n";
     std::vector<bool> controllableAPs (hoa.noAPs, false);
     for (size_t c = 0; c < hoa.noCntAPs; c++)
     {
         controllableAPs[hoa.cntAPs[c]] = true;
     }
     
-    std::cout << "Creating states, resizing to " << hoa.noStates << std::endl;
+    std::vector<int> parityPriorities(hoa.noAccSets, 0);
+    handlePriorityTree(hoa.acc, parityPriorities);
+    for (auto p : parityPriorities)
+    {
+        std::cout << p << " ";
+    }
+    std::cout << std::endl;
+
     PGstates.resize(hoa.noStates);
     for (size_t s = 0; s < hoa.noStates; s++)
     {
         State state = hoa.states[s];
         PGstates[s] = PGState{state.id};
-        if (state.noAccSig < 1) {
-            std::cout << "The state has no accSig...\n";
+        int statePrio{ -1 };
+        bool accIsStateBased{ false };
+        for (size_t a = 0; a < state.noAccSig; a++)
+        {
+            statePrio = std::max(statePrio, parityPriorities[state.accSig[a]]);
         }
-        priorities[state.accSig[0]].push_back(s);
         
         std::unordered_set<int> allUncontrollableAP;
         std::vector<PGTransition> allOutgoing;
         // Collect all outgoing transitions and not controllable APs
         for (size_t t = 0; t < state.noTrans; t++)
         {
-            assert(state.transitions[t].noSucc == 1);
-            auto transition = btreeToBDD(state.transitions[t].label, controllableAPs);
-            transition.target = state.transitions[t].successors[0];
+            Transition trans = state.transitions[t];
+            assert(trans.noSucc == 1);
+            auto transition = btreeToBDD(trans.label, controllableAPs);
+            transition.target = trans.successors[0];
+
+            for (size_t a = 0; a < trans.noAccSig; a++)
+            {
+                statePrio = std::max(statePrio, parityPriorities[trans.accSig[a]]);
+                transition.transitionPrio = parityPriorities[trans.accSig[a]];
+            }
+
             allOutgoing.push_back(transition);
 
-            allUncontrollableAP.insert(transition.notControllable.begin(), transition.notControllable.end());
+            allUncontrollableAP.merge(transition.notControllable);
         }
 
+        if (statePrio == -1) statePrio = parityPriorities.back() + 1;
+        priorities[statePrio].push_back(s);
+        
         if (allUncontrollableAP.empty()) 
         {
             // The transitions are all entirely made up of controllable APs, we can just use it as is
@@ -299,8 +320,6 @@ int main(int argc, char** argv)
 
                 size_t intermediaryState = PGstates.size();
                 PGstates.push_back({state.id, fixedTransition, true});
-                // New intermediary state inherits priority from original
-                priorities[state.accSig[0]].push_back(intermediaryState);
                 outgoingTransitions[state.id][intermediaryState] = fixedTransition;
                 incomingTransitions[intermediaryState][state.id] = fixedTransition;
                 
@@ -312,12 +331,14 @@ int main(int argc, char** argv)
                         incomingTransitions[t.target][intermediaryState] = newLabel;
                     }   
                 }
+
+                // Intermediary states get the dummy prio 0
+                priorities[0].push_back(intermediaryState);
             }
         }
         
     }
 
-    std::cout << "Starting Zielonka...\n";
     std::vector<bool> included (PGstates.size(), true);
     auto [w_even, w_odd] = zielonka(included);
     std::cout << "Even player winning positions: " << w_even.size() << std::endl;
@@ -335,7 +356,7 @@ int main(int argc, char** argv)
             break;
         }
     }
-    std::cout << "Realizable: " << evenWins << std::endl; 
+    std::cout << "Realizable: " << evenWins << std::endl;
 
     if(res != 0) {
         std::cout << argv[1] << "\n";
