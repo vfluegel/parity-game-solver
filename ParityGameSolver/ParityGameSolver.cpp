@@ -6,6 +6,9 @@
 #include <unordered_set>
 #include <queue>
 #include <cassert>
+#include <chrono>
+#include <thread>
+#include <future>
 #include <oxidd/util.hpp>
 #include <oxidd/bdd.hpp>
 
@@ -13,7 +16,7 @@ extern "C" {
     #include "simplehoa.h"
 }
 
-oxidd::bdd_manager manager{20480, 10240, 8};
+oxidd::bdd_manager manager{2097152, 1048576, 8};
 std::unordered_map<int, oxidd::bdd_function> aps{};
 std::unordered_map<std::string, BTree*> aliases;
 
@@ -41,7 +44,7 @@ struct ParityGame
 std::vector<PGState> PGstates{};// std::unordered_map<PGState, size_t> inverse{};
 std::unordered_map<int, std::unordered_map<int, oxidd::bdd_function>> outgoingTransitions{};
 std::unordered_map<int, std::unordered_map<int, oxidd::bdd_function>> incomingTransitions{};
-std::map<int, std::vector<int>, std::greater<int>> priorities{};
+std::map<int, std::vector<std::pair<int, int>>, std::greater<int>> priorities{};
 
 PGTransition btreeToBDD(BTree* tree, std::vector<bool> controllable) {
     PGTransition transition{};
@@ -110,7 +113,7 @@ void handlePriorityTree(BTree* tree, std::vector<int>& prios)
     }
 }
 
-std::unordered_set<int> getAttractors(const std::vector<int>& targetSet, bool evenPlayer, const std::vector<bool>& includedStates) {
+std::unordered_set<int> getAttractors(const std::unordered_set<int>& targetSet, bool evenPlayer, const std::vector<bool>& includedStates) {
     std::unordered_set<int> attractors;
     std::queue<int> processingQueue;
 
@@ -174,16 +177,30 @@ std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates
     auto prioIterator = priorities.begin();
     while (!foundPrio)
     {
-        assert(prioIterator != priorities.end());
+        if (prioIterator == priorities.end()) {
+            // We couldn't find a priority to use - essentially the same as having all states gone
+            return res;
+        }
         maxPrio = prioIterator->first;
         // We can't use that priority if no state with the priority is included anymore
         foundPrio = std::any_of(priorities[maxPrio].begin(), priorities[maxPrio].end(), 
-                                [&includedStates](int v) { return includedStates[v]; });
+                                [&includedStates](std::pair<int, int> v) { return includedStates[v.first] && includedStates[v.second]; });
         if (!foundPrio) prioIterator++;
     }
 
     int i = maxPrio % 2;
-    std::unordered_set<int> R = getAttractors(priorities[maxPrio], i == 0, includedStates);
+    // Iterate through the transitions with the highest priority and add their endpoints to the target set
+    std::unordered_set<int> prioTransitionsTargetStates;
+    for (auto transition : priorities[maxPrio])
+    {
+        if (includedStates[transition.first] && includedStates[transition.second]) {
+            // We can take the transition with the high priority from the start of the state
+            prioTransitionsTargetStates.insert(transition.first);
+        }
+        
+    }
+    
+    std::unordered_set<int> R = getAttractors(prioTransitionsTargetStates, i == 0, includedStates);
     // Remove all attractors from the included states
     std::vector<bool> newIncludedStates{ includedStates };
     for (int a : R)
@@ -196,11 +213,10 @@ std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates
         R.merge(zielonkaRes[i]);
         // Only set the first part of the pair
         res[i] = R;
-        assert (res[1-i].empty());
     }
     else 
     {
-        std::unordered_set<int> S = getAttractors({zielonkaRes[1-i].begin(), zielonkaRes[1-i].end()}, i != 0, includedStates);
+        std::unordered_set<int> S = getAttractors(zielonkaRes[1-i], i != 0, includedStates);
         newIncludedStates = includedStates;
         for (int a : S)
         {
@@ -214,19 +230,35 @@ std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates
     return res;
 }
 
+void timer(std::future<void> future)
+{
+    if (future.wait_for(std::chrono::seconds(60)) == std::future_status::timeout) {
+        std::cout << "Operation timed out!" << std::endl;
+        abort(); // Timeout occurs, terminate the program
+    }
+}
+
 int main(int argc, char** argv)
 {
+    std::cout << argv[1] << std::endl;
+
+    std::promise<void> cancelPromise;
+    std::future<void> cancelFuture = cancelPromise.get_future();
+
+    std::thread timerThread(timer, std::move(cancelFuture));
+
     HoaData hoa;
     defaultsHoa(&hoa);
     auto inputFile = fopen(argv[1], "r");
     int res = parseHoa(inputFile, &hoa);
     fclose(inputFile);
     if (res != 0) {
-        std::cout << "Input could not be parsed!\n";
+        std::cerr << "Input could not be parsed!\n";
+        exit(1);
     }
-
-    //generateDotFile(&hoa, "inputHOA.dot");
-
+#ifndef NDEBUG
+    generateDotFile(&hoa, "inputHOA.dot");
+#endif
     for (size_t ap = 0; ap < hoa.noAPs; ap++)
     {
         aps[ap] = manager.new_var();
@@ -245,19 +277,13 @@ int main(int argc, char** argv)
     
     std::vector<int> parityPriorities(hoa.noAccSets, 0);
     handlePriorityTree(hoa.acc, parityPriorities);
-    for (auto p : parityPriorities)
-    {
-        std::cout << p << " ";
-    }
-    std::cout << std::endl;
-
+    
     PGstates.resize(hoa.noStates);
     for (size_t s = 0; s < hoa.noStates; s++)
     {
         State state = hoa.states[s];
         PGstates[s] = PGState{state.id};
         int statePrio{ -1 };
-        bool accIsStateBased{ false };
         for (size_t a = 0; a < state.noAccSig; a++)
         {
             statePrio = std::max(statePrio, parityPriorities[state.accSig[a]]);
@@ -272,20 +298,17 @@ int main(int argc, char** argv)
             assert(trans.noSucc == 1);
             auto transition = btreeToBDD(trans.label, controllableAPs);
             transition.target = trans.successors[0];
+            transition.transitionPrio = statePrio;
 
             for (size_t a = 0; a < trans.noAccSig; a++)
             {
-                statePrio = std::max(statePrio, parityPriorities[trans.accSig[a]]);
-                transition.transitionPrio = parityPriorities[trans.accSig[a]];
+                transition.transitionPrio = std::max(transition.transitionPrio, parityPriorities[trans.accSig[a]]);
             }
 
             allOutgoing.push_back(transition);
 
             allUncontrollableAP.merge(transition.notControllable);
         }
-
-        if (statePrio == -1) statePrio = parityPriorities.back() + 1;
-        priorities[statePrio].push_back(s);
         
         if (allUncontrollableAP.empty()) 
         {
@@ -295,6 +318,8 @@ int main(int argc, char** argv)
                 assert (t.target != -1);
                 outgoingTransitions[state.id][t.target] = t.label;
                 incomingTransitions[t.target][state.id] = t.label;
+                if (t.transitionPrio == -1) t.transitionPrio = parityPriorities.back() + 1;
+                priorities[t.transitionPrio].emplace_back(state.id, t.target);
             }
         }
         else 
@@ -329,11 +354,10 @@ int main(int argc, char** argv)
                         assert (t.target != -1);
                         outgoingTransitions[intermediaryState][t.target] = newLabel;
                         incomingTransitions[t.target][intermediaryState] = newLabel;
+                        if (t.transitionPrio == -1) t.transitionPrio = parityPriorities.back() + 1;
+                        priorities[t.transitionPrio].emplace_back(intermediaryState, t.target);
                     }   
                 }
-
-                // Intermediary states get the dummy prio 0
-                priorities[0].push_back(intermediaryState);
             }
         }
         
@@ -341,10 +365,11 @@ int main(int argc, char** argv)
 
     std::vector<bool> included (PGstates.size(), true);
     auto [w_even, w_odd] = zielonka(included);
+#ifndef NDEBUG
     std::cout << "Even player winning positions: " << w_even.size() << std::endl;
     std::cout << "Odd player winning positions: " << w_odd.size() << std::endl;
     assert(w_even.size() + w_odd.size() == PGstates.size());
-    
+#endif    
     bool evenWins = true;
     for (int s = 0; s < hoa.noStart; s++)
     {
@@ -357,11 +382,10 @@ int main(int argc, char** argv)
         }
     }
     std::cout << "Realizable: " << evenWins << std::endl;
+    
+    // Signal the timer thread to stop
+    cancelPromise.set_value();
+    // Join the timer thread to ensure proper cleanup
+    timerThread.join();
 
-    if(res != 0) {
-        std::cout << argv[1] << "\n";
-    }
-    else {
-        std::cout << "Fibnish!\n";
-    }
 }
