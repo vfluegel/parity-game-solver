@@ -23,15 +23,14 @@ std::unordered_map<std::string, BTree*> aliases;
 struct PGTransition
 {
     oxidd::bdd_function label;
-    std::unordered_set<int> notControllable;
     int target{ -1 };
+    std::unordered_set<int> notControllable;
     int transitionPrio{ -1 };
 };
 
 struct PGState 
 {
     int id;
-    oxidd::bdd_function notControllable;
     bool belongsToEven{ false };
 };
 
@@ -41,9 +40,9 @@ struct ParityGame
     std::vector<PGState> states{};
 };
 
-std::vector<PGState> PGstates{};// std::unordered_map<PGState, size_t> inverse{};
-std::unordered_map<int, std::unordered_map<int, oxidd::bdd_function>> outgoingTransitions{};
-std::unordered_map<int, std::unordered_map<int, oxidd::bdd_function>> incomingTransitions{};
+std::vector<PGState> PGstates{};
+std::vector<std::vector<int>> outgoing{};
+std::vector<std::vector<int>> incoming{};
 std::map<int, std::vector<std::pair<int, int>>, std::greater<int>> priorities{};
 
 PGTransition btreeToBDD(BTree* tree, std::vector<bool> controllable) {
@@ -120,8 +119,11 @@ std::unordered_set<int> getAttractors(const std::unordered_set<int>& targetSet, 
     // Initialize attractors with the target set
     for (int state : targetSet) {
         if (includedStates[state]) {
-            processingQueue.push(state);
             attractors.insert(state);
+            // Add all incoming states to the target set to be checked as attractor
+            for (const auto& from : incoming[state]) {
+                if (includedStates[from]) processingQueue.push(from);
+            }
         }
     }
 
@@ -130,33 +132,34 @@ std::unordered_set<int> getAttractors(const std::unordered_set<int>& targetSet, 
         int current = processingQueue.front();
         processingQueue.pop();
 
-        for (const auto& [from, label] : incomingTransitions[current]) {
-            if (!includedStates[from] || !label.satisfiable()) {
-                continue;
-            }
+        // If the state is already in the attractors, we don't have to check it again
+        if (attractors.contains(current) ) {
+            continue;
+        }
 
-            bool isAttractor = false;
+        bool isAttractor = false;
 
-            if (PGstates[from].belongsToEven == evenPlayer) {
-                // Current player's state: add if at least one successor is in attractors
-                isAttractor = true;
-            } else {
-                // Opponent's state: add if all successors are in attractors
-                isAttractor = true;
-                for (const auto& [to, outLabel] : outgoingTransitions[from]) {
-                    if (includedStates[to] && outLabel.satisfiable() && !attractors.contains(to)) {
-                        isAttractor = false;
-                        break;
-                    }
+        if (PGstates[current].belongsToEven == evenPlayer) {
+            // Current player's state: add if at least one successor is in attractors
+            isAttractor = true;
+        } else {
+            // Opponent's state: add if all successors are in attractors
+            isAttractor = true;
+            for (auto& to : outgoing[current]) {
+                if (includedStates[to] && !attractors.contains(to)) {
+                    isAttractor = false;
+                    break;
                 }
             }
+        }    
 
-            if (isAttractor && !attractors.contains(from)) {
-                assert (includedStates[from]);
-                attractors.insert(from);
-                processingQueue.push(from);
+        if (isAttractor) {
+            attractors.insert(current);
+            for (auto& from : incoming[current]) {
+                if (includedStates[from] && !attractors.contains(from)) processingQueue.push(from);
             }
         }
+
     }
 
     return attractors;
@@ -232,7 +235,7 @@ std::array<std::unordered_set<int>, 2> zielonka(std::vector<bool> includedStates
 
 void timer(std::future<void> future)
 {
-    if (future.wait_for(std::chrono::seconds(60)) == std::future_status::timeout) {
+    if (future.wait_for(std::chrono::seconds(120)) == std::future_status::timeout) {
         std::cout << "Operation timed out!" << std::endl;
         abort(); // Timeout occurs, terminate the program
     }
@@ -279,10 +282,12 @@ int main(int argc, char** argv)
     handlePriorityTree(hoa.acc, parityPriorities);
     
     PGstates.resize(hoa.noStates);
+    outgoing.resize(hoa.noStates);
+    incoming.resize(hoa.noStates);
     for (size_t s = 0; s < hoa.noStates; s++)
     {
         State state = hoa.states[s];
-        PGstates[s] = PGState{state.id};
+        PGstates[s].id = state.id;
         int statePrio{ -1 };
         for (size_t a = 0; a < state.noAccSig; a++)
         {
@@ -314,12 +319,13 @@ int main(int argc, char** argv)
         {
             // The transitions are all entirely made up of controllable APs, we can just use it as is
             PGstates[s].belongsToEven = true;
+            outgoing[state.id].reserve(allOutgoing.size());
             for (PGTransition t : allOutgoing) {
                 assert (t.target != -1);
-                outgoingTransitions[state.id][t.target] = t.label;
-                incomingTransitions[t.target][state.id] = t.label;
                 if (t.transitionPrio == -1) t.transitionPrio = parityPriorities.back() + 1;
                 priorities[t.transitionPrio].emplace_back(state.id, t.target);
+                outgoing[state.id].push_back(t.target);
+                incoming[t.target].push_back(state.id);
             }
         }
         else 
@@ -328,6 +334,7 @@ int main(int argc, char** argv)
             // Possible combinations for the uncontrollable vars
             int numCombinations = 1 << numNotControllable; 
             
+            outgoing[state.id].reserve(numCombinations);
             for (int comb = 0; comb < numCombinations; comb++) {
                 // Start by fixing the first variable in the uncontrollable set
                 bool val = (comb & (1 << 0)) != 0;
@@ -344,18 +351,22 @@ int main(int argc, char** argv)
                 }
 
                 size_t intermediaryState = PGstates.size();
-                PGstates.push_back({state.id, fixedTransition, true});
-                outgoingTransitions[state.id][intermediaryState] = fixedTransition;
-                incomingTransitions[intermediaryState][state.id] = fixedTransition;
+                PGstates.push_back({state.id + hoa.noStates + comb, true});
+                outgoing[state.id].push_back(intermediaryState);
+                incoming.push_back({state.id});
+                if (incoming.size() - 1 != intermediaryState) std::cerr << "The last element of incoming does not match the newTransition\n";
                 
+                outgoing.emplace_back();
+                if (outgoing.size() - 1 != intermediaryState) std::cerr << "The last element of outgoing does not match the newTransition\n";
+                outgoing[intermediaryState].reserve(allOutgoing.size());
                 for (PGTransition t : allOutgoing) {
                     oxidd::bdd_function newLabel = fixedTransition & t.label;
                     if (newLabel.satisfiable()) {
                         assert (t.target != -1);
-                        outgoingTransitions[intermediaryState][t.target] = newLabel;
-                        incomingTransitions[t.target][intermediaryState] = newLabel;
                         if (t.transitionPrio == -1) t.transitionPrio = parityPriorities.back() + 1;
                         priorities[t.transitionPrio].emplace_back(intermediaryState, t.target);
+                        outgoing[intermediaryState].push_back(t.target);
+                        incoming[t.target].push_back(intermediaryState);
                     }   
                 }
             }
