@@ -247,7 +247,7 @@ int main(int argc, char** argv)
         int res = parseHoa(inputFile, &hoa);
         fclose(inputFile);
         if (res != 0) {
-            std::cerr << "Input could not be parsed!\n";
+            std::cerr << "Input " << argv[1] << " could not be parsed!\n";
             // Signal the timer thread to stop
             cancelPromise.set_value();
             // Join the timer thread to ensure proper cleanup
